@@ -1,8 +1,11 @@
 import sys
 import copy
+import json
 import datetime
 import dateutil
+import websocket
 
+from uuid import uuid4
 from functools import wraps
 
 # tqdm creates 2 globals lock which raise OSException if the execution
@@ -13,6 +16,8 @@ try:
     no_tqdm = False
 except OSError:
     no_tqdm = True
+
+import requests
 
 from .log import logger
 from .exceptions import PapermillException
@@ -290,6 +295,93 @@ class Engine(object):
         raise NotImplementedError("'execute_managed_notebook' is not implemented for this engine")
 
 
+class MyBinderEngine(Engine):
+    def start_binder(repo, ref='master', binder_url='https://mybinder.org'):
+        """Launch a binder"""
+        url = binder_url + f'/build/gh/{repo}/{ref}'
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        for line in r.iter_lines():
+            line = line.decode('utf8', 'replace')
+            if line.startswith('data:'):
+                yield json.loads(line.split(':', 1)[1])
+
+    @classmethod
+    def execute_managed_notebook(
+        cls,
+        managed_nb,
+        kernel_name,
+        log_output=False,
+        start_timeout=60,
+        execution_timeout=None,
+        **kwargs,
+    ):
+        session = requests.Session()
+        repo = 'binder-examples/requirements'
+        for evt in cls.start_binder(repo):
+            if evt.get('phase') == 'ready':
+                print(evt)
+                # spawn a kernel
+                url = "{url}api/kernels?token={token}".format(**evt)
+                r = session.post(url, json={"path": "", "name": "python3"})
+                r.raise_for_status()
+                print(r.json())
+
+                cookie = r.headers['set-cookie']
+                kernel_id = r.json()['id']
+                # connect websocket with our login cookie:
+                ws_url = 'ws' + evt['url'][4:]  # http[s] -> ws[s]
+                print(ws_url)
+                print(
+                    '{0}api/kernels/{1}/channels?token={2}'.format(ws_url, kernel_id, evt['token'])
+                )
+                ws = websocket.WebSocket()
+                ws.connect(
+                    '{0}api/kernels/{1}/channels?token={2}'.format(ws_url, kernel_id, evt['token'])
+                )  # , cookie=cookie)
+
+                msg = {
+                    'header': {
+                        'username': '',
+                        'version': '5.0',
+                        'session': '',
+                        'msg_id': uuid4().hex,
+                        'msg_type': 'execute_request',
+                    },
+                    'parent_header': {},
+                    'channel': 'shell',
+                    'content': {
+                        'code': 'print(23)',
+                        'silent': False,
+                        'store_history': False,
+                        'user_expressions': {},
+                        'allow_stdin': False,
+                    },
+                    'metadata': {},
+                    'buffers': {},
+                }
+                msg = {
+                    'header': {
+                        'username': '',
+                        'version': '5.0',
+                        'session': uuid4().hex,
+                        'msg_id': uuid4().hex,
+                        'msg_type': 'kernel_info_request',
+                    },
+                    'content': {},
+                    'parent_header': {},
+                    'metadata': {},
+                }
+                import pprint
+
+                print('sending')
+                pprint.pprint(msg)
+                ws.send(json.dumps(msg))
+                print('receiving')
+                while True:
+                    pprint.pprint(json.loads(ws.recv()))
+
+
 class NBConvertEngine(Engine):
     """
     A notebook engine which can execute a notebook document and update the
@@ -304,7 +396,7 @@ class NBConvertEngine(Engine):
         log_output=False,
         start_timeout=60,
         execution_timeout=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Performs the actual execution of the parameterized notebook locally.
@@ -333,3 +425,4 @@ class NBConvertEngine(Engine):
 papermill_engines = PapermillEngines()
 papermill_engines.register(None, NBConvertEngine)
 papermill_engines.register('nbconvert', NBConvertEngine)
+papermill_engines.register('mybinder', MyBinderEngine)
